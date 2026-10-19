@@ -50,16 +50,22 @@ jobs:
         with:
           go-version-file: urunc/go.mod
           cache: false
+      - name: Fetch the base branch
+        working-directory: urunc
+        run: git fetch "https://github.com/${BASE_REPO}.git" "${BASE_REF}:refs/remotes/base/main"
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev pkg-config
       - name: Unit tests (make unittest)
         working-directory: urunc
         run: make unittest
-      - name: Lint (same golangci-lint version as upstream)
+      - name: Lint (same golangci-lint version as upstream, new issues only)
+        # Upstream lints PRs with only-new-issues: true, so pre-existing
+        # findings (e.g. dupl in hvt.go/spt.go) do not count against a PR
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.9
           working-directory: urunc
+          args: --new-from-rev=base/main
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -70,8 +76,7 @@ jobs:
         working-directory: urunc/.github/linters
         run: |
           npm install --legacy-peer-deps
-          git fetch "https://github.com/${BASE_REPO}.git" "${BASE_REF}"
-          npx commitlint --from=FETCH_HEAD --config ./commitlint.config.js --verbose
+          npx commitlint --from=base/main --config ./commitlint.config.js --verbose
 
   e2e:
     name: e2e ${{ matrix.tool }} FreeBSD (${{ matrix.mode }})
