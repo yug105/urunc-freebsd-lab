@@ -1,0 +1,234 @@
+name: urunc FreeBSD lab
+
+# Personal test bench for urunc-dev/urunc#1108. It never touches the urunc
+# repository: it checks out a urunc branch, builds it and runs it on a GitHub
+# runner with KVM, like upstream's .github/workflows/vm_test.yml does.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fix_repo:
+        description: Repository with the change under test
+        default: yug105/urunc
+      fix_ref:
+        description: Branch, tag or SHA with the change
+        default: main
+      base_repo:
+        description: Repository to compare against (the "before")
+        default: urunc-dev/urunc
+      base_ref:
+        description: Ref to compare against
+        default: main
+      iterations:
+        description: Containers per timing pass
+        default: '30'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  FIX_REPO: ${{ inputs.fix_repo || 'yug105/urunc' }}
+  FIX_REF: ${{ inputs.fix_ref || 'main' }}
+  BASE_REPO: ${{ inputs.base_repo || 'urunc-dev/urunc' }}
+  BASE_REF: ${{ inputs.base_ref || 'main' }}
+  ITERATIONS: ${{ inputs.iterations || '30' }}
+
+jobs:
+  checks:
+    name: Unit tests, lint, spelling, commit messages (fix)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_REF }}
+          path: urunc
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: urunc/go.mod
+          cache: false
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev pkg-config
+      - name: Unit tests (make unittest)
+        working-directory: urunc
+        run: make unittest
+      - name: Lint (same golangci-lint version as upstream)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.9
+          working-directory: urunc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Spell check (same config as upstream)
+        working-directory: urunc
+        run: npx --yes cspell --config .github/linters/.cspell.json --no-progress
+      - name: Commit messages since upstream main (same rules as upstream)
+        working-directory: urunc/.github/linters
+        run: |
+          npm install --legacy-peer-deps
+          git fetch "https://github.com/${BASE_REPO}.git" "${BASE_REF}"
+          npx commitlint --from=FETCH_HEAD --config ./commitlint.config.js --verbose
+
+  e2e:
+    name: e2e ${{ matrix.tool }} FreeBSD (${{ matrix.mode }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The FreeBSD cases live in nerdctlTestCases (9pfs, devmapper) and
+        # dockerTestCases (block) in tests/e2e/test_cases.go
+        tool: [nerdctl, docker]
+        mode: [default, libcontainer]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_REF }}
+          path: urunc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: urunc/go.mod
+          cache: false
+      - name: Set up the host
+        run: sudo -E lab/scripts/setup-host.sh "$PWD/urunc"
+      - name: Build and install urunc (fix)
+        run: |
+          lab/scripts/build-urunc.sh urunc bin-fix
+          sudo lab/scripts/install-urunc.sh bin-fix
+      - name: Enable libcontainer mode
+        if: matrix.mode == 'libcontainer'
+        run: |
+          # Upstream CI only changes config.toml, so do the same
+          printf '\n[runtime]\nlibcontainer = true\n' | sudo tee -a /etc/urunc/config.toml
+      - name: Run FreeBSD e2e cases
+        working-directory: urunc
+        run: |
+          export GOROOT="$(go env GOROOT)"
+          export PATH="$GOROOT/bin:$PATH"
+          sudo -E env "PATH=$PATH" "GOROOT=$GOROOT" make "test_${{ matrix.tool }}_freebsd" 2>&1 | tee ../e2e.log
+          status="${PIPESTATUS[0]}"
+          # A focus that matches nothing passes silently, so fail on it
+          if grep -q "Ran 0 of" ../e2e.log; then
+            echo "::error::no FreeBSD e2e case matched"
+            exit 1
+          fi
+          exit "$status"
+      - name: Dump urunc logs on failure
+        if: failure()
+        run: sudo journalctl --identifier=urunc --no-pager | tail -n 400
+
+  ext2-boot:
+    name: boot ${{ matrix.fs }} block rootfs on ${{ matrix.monitor }} (${{ matrix.side }})
+    runs-on: ubuntu-22.04
+    # On the base side the ext2 case is expected to fail: that failure is
+    # the bug. Keep the workflow green and read the summary instead.
+    continue-on-error: ${{ matrix.side == 'base' && matrix.fs == 'ext2' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, fix]
+        monitor: [qemu, firecracker]
+        fs: [ufs, ext2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.side == 'base' && env.BASE_REPO || env.FIX_REPO }}
+          ref: ${{ matrix.side == 'base' && env.BASE_REF || env.FIX_REF }}
+          path: urunc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: urunc/go.mod
+          cache: false
+      - name: Set up the host
+        run: sudo -E lab/scripts/setup-host.sh "$PWD/urunc"
+      - name: Build and install urunc (${{ matrix.side }})
+        run: |
+          lab/scripts/build-urunc.sh urunc bin
+          sudo lab/scripts/install-urunc.sh bin
+      - name: Prepare the image
+        id: image
+        run: |
+          if [ "${{ matrix.fs }}" = "ufs" ]; then
+            echo "tag=harbor.nbfc.io/nubificus/urunc/caddy-${{ matrix.monitor }}-freebsd-block:latest" >> "$GITHUB_OUTPUT"
+          else
+            sudo lab/scripts/make-ext2-image.sh "${{ matrix.monitor }}" "lab/caddy-${{ matrix.monitor }}-freebsd-ext2:latest"
+            echo "tag=lab/caddy-${{ matrix.monitor }}-freebsd-ext2:latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Boot it
+        run: |
+          rt=io.containerd.urunc.v2
+          [ "${{ matrix.monitor }}" = "firecracker" ] && rt=io.containerd.urunc-fc.v2
+          set +e
+          sudo lab/scripts/boot-image.sh "${{ steps.image.outputs.tag }}" "$rt" \
+            "${{ matrix.fs }}-${{ matrix.monitor }}-${{ matrix.side }}" logs | tee boot.txt
+          status="${PIPESTATUS[0]}"
+          {
+            echo "### ${{ matrix.side }} / ${{ matrix.monitor }} / ${{ matrix.fs }}"
+            echo '```'
+            grep -E 'mountfrom|mount root|mountroot|RESULT' boot.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-${{ matrix.side }}-${{ matrix.monitor }}-${{ matrix.fs }}
+          path: logs/
+
+  timing:
+    name: create/start timing (base vs fix, same runner)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BASE_REPO }}
+          ref: ${{ env.BASE_REF }}
+          path: urunc-base
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_REF }}
+          path: urunc-fix
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: urunc-fix/go.mod
+          cache: false
+      - name: Set up the host
+        run: sudo -E lab/scripts/setup-host.sh "$PWD/urunc-fix"
+      - name: Build both versions
+        run: |
+          lab/scripts/build-urunc.sh urunc-base bin-base
+          lab/scripts/build-urunc.sh urunc-fix bin-fix
+      - name: Measure base
+        run: |
+          sudo lab/scripts/install-urunc.sh bin-base
+          sudo lab/scripts/timing.sh base "$ITERATIONS" timing
+      - name: Measure fix
+        run: |
+          sudo lab/scripts/install-urunc.sh bin-fix
+          sudo lab/scripts/timing.sh fix "$ITERATIONS" timing
+      - name: Summary
+        run: |
+          sudo chmod -R a+r timing
+          python3 -I lab/scripts/ts_stats.py \
+            base-warm=timing/base-warm.zlog fix-warm=timing/fix-warm.zlog \
+            base-cold=timing/base-cold.zlog fix-cold=timing/fix-cold.zlog \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timing
+          path: timing/
