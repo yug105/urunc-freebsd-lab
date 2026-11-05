@@ -1,0 +1,62 @@
+name: FreeBSD filesystem acceptance
+
+# Research run: which rootfs filesystems does the FreeBSD kernel in urunc's
+# caddy image actually mount? Uses a urunc branch that passes ufs for any UFS
+# magic and ext2fs for any ext magic, so the outcome is the kernel's decision.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fix_repo:
+        default: yug105/urunc
+      fix_ref:
+        default: freebsd-docs-rootfs
+
+permissions:
+  contents: read
+
+env:
+  FIX_REPO: ${{ inputs.fix_repo }}
+  FIX_REF: ${{ inputs.fix_ref }}
+
+jobs:
+  boot:
+    name: boot ${{ matrix.fs }}
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext2, ext3, ext4, ufs1, ufs2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_REF }}
+          path: urunc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: urunc/go.mod
+          cache: false
+      - name: Set up the host
+        run: sudo -E lab/scripts/setup-host.sh "$PWD/urunc"
+      - name: Install makefs
+        run: sudo apt-get install -y makefs
+      - name: Build and install urunc
+        run: |
+          lab/scripts/build-urunc.sh urunc bin
+          sudo lab/scripts/install-urunc.sh bin
+      - name: Prepare the image
+        run: sudo lab/scripts/make-fs-image.sh qemu "${{ matrix.fs }}" "lab/fs-${{ matrix.fs }}:latest"
+      - name: Boot it
+        env:
+          BOOT_TIMEOUT: "60"
+        run: sudo -E lab/scripts/boot-image.sh "lab/fs-${{ matrix.fs }}:latest" io.containerd.urunc.v2 "fs-${{ matrix.fs }}" logs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fs-${{ matrix.fs }}
+          path: logs/
