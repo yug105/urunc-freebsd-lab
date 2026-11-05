@@ -63,7 +63,7 @@ jobs:
         # findings (e.g. dupl in hvt.go/spt.go) do not count against a PR
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.9
+          version: v2.15
           working-directory: urunc
           args: --new-from-rev=base/main
       - uses: actions/setup-node@v4
