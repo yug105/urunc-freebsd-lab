@@ -16,6 +16,7 @@ from collections import defaultdict
 SPANS = {
     "create (TS01->TS02)": ("TS01", "TS02"),
     "start (TS11->TS18)": ("TS11", "TS18"),
+    "exec setup (TS17->TS18)": ("TS17", "TS18"),
 }
 
 
